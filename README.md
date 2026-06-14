@@ -11,7 +11,7 @@ It has two modes:
 
 ```text
 User device
-  -> sing-box VPS :20010
+  -> sing-box VPS proxy port
   -> AI domain matched by sing-box route/DNS rules
   -> DNS query to unlock VPS :53
   -> AI domain resolves to unlock VPS IP
@@ -21,14 +21,22 @@ User device
 
 ## Quick start
 
-Replace the IPs below with your own.
+You can run the script interactively and enter IPs when prompted, or pass them as flags.
 
 ### 1. On the unlock/exit VPS
+
+Interactive:
 
 ```bash
 wget -O ai_singbox_unlock_setup.sh https://raw.githubusercontent.com/LYISTR2/singbox-ai-unlock/main/ai_singbox_unlock_setup.sh
 chmod +x ai_singbox_unlock_setup.sh
-bash ai_singbox_unlock_setup.sh unlock-server --unlock-ip 23.147.232.116 --client-ip 103.97.175.188
+bash ai_singbox_unlock_setup.sh unlock-server
+```
+
+Non-interactive:
+
+```bash
+bash ai_singbox_unlock_setup.sh unlock-server --unlock-ip <UNLOCK_VPS_IP> --client-ip <SINGBOX_CLIENT_IP>
 ```
 
 This will:
@@ -41,10 +49,18 @@ This will:
 
 ### 2. On the sing-box VPS/client
 
+Interactive:
+
 ```bash
 wget -O ai_singbox_unlock_setup.sh https://raw.githubusercontent.com/LYISTR2/singbox-ai-unlock/main/ai_singbox_unlock_setup.sh
 chmod +x ai_singbox_unlock_setup.sh
-bash ai_singbox_unlock_setup.sh singbox-client --unlock-ip 23.147.232.116 --config /usr/local/etc/sing-box/config.json
+bash ai_singbox_unlock_setup.sh singbox-client
+```
+
+Non-interactive:
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client --unlock-ip <UNLOCK_VPS_IP> --config /usr/local/etc/sing-box/config.json
 ```
 
 This will:
@@ -65,7 +81,7 @@ tcp://<unlock-ip>
 If your unlock VPS allows UDP/53 and it works from the client VPS, you may use:
 
 ```bash
-bash ai_singbox_unlock_setup.sh singbox-client --unlock-ip 23.147.232.116 --dns-transport udp
+bash ai_singbox_unlock_setup.sh singbox-client --unlock-ip <UNLOCK_VPS_IP> --dns-transport udp
 ```
 
 ## Options
