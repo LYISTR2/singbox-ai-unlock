@@ -7,8 +7,10 @@ set -Eeuo pipefail
 #   singbox-client : patch sing-box client/server config so selected AI domains resolve to unlock VPS and route direct
 #
 # Example:
-#   bash ai_singbox_unlock_setup.sh unlock-server --unlock-ip 23.147.232.116 --client-ip 103.97.175.188
-#   bash ai_singbox_unlock_setup.sh singbox-client --unlock-ip 23.147.232.116 --config /usr/local/etc/sing-box/config.json
+#   bash ai_singbox_unlock_setup.sh unlock-server
+#   bash ai_singbox_unlock_setup.sh singbox-client
+#
+# You can pass IPs via flags or enter them interactively when prompted.
 
 SCRIPT_NAME="$(basename "$0")"
 MODE=""
@@ -76,14 +78,18 @@ Modes:
       - backup original config before editing
 
 Examples:
-  # On unlock VPS / exit VPS:
-  bash $SCRIPT_NAME unlock-server --unlock-ip 23.147.232.116 --client-ip 103.97.175.188
+  # Interactive mode on unlock VPS / exit VPS:
+  bash $SCRIPT_NAME unlock-server
 
-  # On sing-box client/server VPS:
-  bash $SCRIPT_NAME singbox-client --unlock-ip 23.147.232.116 --config /usr/local/etc/sing-box/config.json
+  # Interactive mode on sing-box client/server VPS:
+  bash $SCRIPT_NAME singbox-client
+
+  # Non-interactive mode:
+  bash $SCRIPT_NAME unlock-server --unlock-ip <UNLOCK_VPS_IP> --client-ip <SINGBOX_CLIENT_IP>
+  bash $SCRIPT_NAME singbox-client --unlock-ip <UNLOCK_VPS_IP> --config /usr/local/etc/sing-box/config.json
 
   # If your unlock DNS supports UDP/53 from the client:
-  bash $SCRIPT_NAME singbox-client --unlock-ip 23.147.232.116 --dns-transport udp
+  bash $SCRIPT_NAME singbox-client --unlock-ip <UNLOCK_VPS_IP> --dns-transport udp
 EOF
 }
 
@@ -97,6 +103,61 @@ need_cmd() {
 
 valid_ipish() {
   [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]
+}
+
+prompt_value() {
+  local var_name="$1"
+  local prompt="$2"
+  local default="${3:-}"
+  local value=""
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " value
+    value="${value:-$default}"
+  else
+    while [[ -z "$value" ]]; do
+      read -r -p "$prompt: " value
+    done
+  fi
+  printf -v "$var_name" '%s' "$value"
+}
+
+prompt_ip() {
+  local var_name="$1"
+  local prompt="$2"
+  local value=""
+  while true; do
+    prompt_value value "$prompt" ""
+    if valid_ipish "$value"; then
+      printf -v "$var_name" '%s' "$value"
+      return 0
+    fi
+    warn "Invalid IPv4 address: $value"
+  done
+}
+
+interactive_fill_missing() {
+  # If stdin is not a TTY, keep strict non-interactive behavior.
+  [[ -t 0 ]] || return 0
+
+  if [[ -z "$UNLOCK_IP" ]]; then
+    prompt_ip UNLOCK_IP "Enter unlock/exit VPS public IPv4"
+  fi
+
+  if [[ "$MODE" == "unlock-server" && -z "$CLIENT_IP" ]]; then
+    prompt_ip CLIENT_IP "Enter sing-box client VPS public IPv4 allowed to use this unlock endpoint"
+  fi
+
+  if [[ "$MODE" == "singbox-client" ]]; then
+    local answer=""
+    prompt_value answer "sing-box config path" "$SINGBOX_CONFIG"
+    SINGBOX_CONFIG="$answer"
+
+    prompt_value answer "optional relay config path; leave default if present" "$SINGBOX_RELAY_CONFIG"
+    SINGBOX_RELAY_CONFIG="$answer"
+
+    prompt_value answer "DNS transport to unlock VPS, tcp or udp" "$DNS_TRANSPORT"
+    DNS_TRANSPORT="$answer"
+  fi
 }
 
 parse_args() {
@@ -122,12 +183,14 @@ parse_args() {
     esac
   done
 
-  [[ -n "$UNLOCK_IP" ]] || die "--unlock-ip is required."
+  interactive_fill_missing
+
+  [[ -n "$UNLOCK_IP" ]] || die "--unlock-ip is required in non-interactive mode."
   valid_ipish "$UNLOCK_IP" || die "--unlock-ip must be an IPv4 address."
   [[ "$DNS_TRANSPORT" == "tcp" || "$DNS_TRANSPORT" == "udp" ]] || die "--dns-transport must be tcp or udp."
 
   if [[ "$MODE" == "unlock-server" ]]; then
-    [[ -n "$CLIENT_IP" ]] || die "unlock-server mode requires --client-ip."
+    [[ -n "$CLIENT_IP" ]] || die "unlock-server mode requires --client-ip in non-interactive mode."
     valid_ipish "$CLIENT_IP" || die "--client-ip must be an IPv4 address."
   fi
 }
@@ -368,7 +431,7 @@ verify_singbox_client() {
   timeout 5 bash -c "</dev/tcp/$UNLOCK_IP/443" && log "TCP 443 open" || warn "TCP 443 not reachable"
 
   log "sing-box listeners matching common ports:"
-  ss -lntup | grep -E 'sing-box|:20010\b' || true
+  ss -lntup | grep -E 'sing-box' || true
 }
 
 main() {
