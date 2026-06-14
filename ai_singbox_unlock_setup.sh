@@ -195,11 +195,109 @@ parse_args() {
   fi
 }
 
-apt_install() {
-  export DEBIAN_FRONTEND=noninteractive
-  log "Installing packages: $*"
-  apt-get update
-  apt-get install -y "$@"
+PKG_MANAGER=""
+INIT_SYSTEM=""
+
+detect_pkg_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+  elif command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+  else
+    die "Unsupported system: neither apt-get nor apk was found. Currently supports Debian/Ubuntu and Alpine Linux."
+  fi
+}
+
+detect_init_system() {
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system || -d /etc/systemd/system ]]; then
+    INIT_SYSTEM="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    INIT_SYSTEM="openrc"
+  else
+    INIT_SYSTEM="unknown"
+  fi
+}
+
+pkg_install() {
+  detect_pkg_manager
+  log "Installing packages via $PKG_MANAGER: $*"
+  case "$PKG_MANAGER" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y "$@"
+      ;;
+    apk)
+      apk update
+      apk add --no-cache "$@"
+      ;;
+  esac
+}
+
+install_dns_packages() {
+  detect_pkg_manager
+  case "$PKG_MANAGER" in
+    apt) pkg_install dnsmasq dnsutils curl ;;
+    apk) pkg_install dnsmasq bind-tools curl ;;
+  esac
+}
+
+install_nginx_packages() {
+  detect_pkg_manager
+  case "$PKG_MANAGER" in
+    apt) pkg_install nginx libnginx-mod-stream curl ;;
+    apk) pkg_install nginx nginx-mod-stream curl ;;
+  esac
+}
+
+svc_exists() {
+  local svc="$1"
+  detect_init_system
+  case "$INIT_SYSTEM" in
+    systemd) systemctl list-unit-files "$svc.service" >/dev/null 2>&1 ;;
+    openrc) [[ -x "/etc/init.d/$svc" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+svc_enable() {
+  local svc="$1"
+  detect_init_system
+  case "$INIT_SYSTEM" in
+    systemd) systemctl enable "$svc" >/dev/null || true ;;
+    openrc) rc-update add "$svc" default >/dev/null 2>&1 || true ;;
+    *) warn "Unknown init system; cannot enable $svc" ;;
+  esac
+}
+
+svc_restart() {
+  local svc="$1"
+  detect_init_system
+  case "$INIT_SYSTEM" in
+    systemd) systemctl restart "$svc" ;;
+    openrc) rc-service "$svc" restart ;;
+    *) warn "Unknown init system; cannot restart $svc"; return 1 ;;
+  esac
+}
+
+svc_stop_disable() {
+  local svc="$1"
+  detect_init_system
+  case "$INIT_SYSTEM" in
+    systemd) systemctl disable --now "$svc" || true ;;
+    openrc) rc-service "$svc" stop || true; rc-update del "$svc" default >/dev/null 2>&1 || true ;;
+    *) warn "Unknown init system; cannot stop/disable $svc" ;;
+  esac
+}
+
+svc_is_active() {
+  local svc="$1"
+  detect_init_system
+  case "$INIT_SYSTEM" in
+    systemd) systemctl is-active "$svc" || true ;;
+    openrc) rc-service "$svc" status || true ;;
+    *) warn "Unknown init system; cannot query $svc" ;;
+  esac
 }
 
 backup_file() {
@@ -212,8 +310,13 @@ backup_file() {
 }
 
 configure_dnsmasq_ai() {
-  apt_install dnsmasq dnsutils curl
+  install_dns_packages
   mkdir -p /etc/dnsmasq.d
+  # Alpine's default dnsmasq.conf may not include /etc/dnsmasq.d; ensure it does.
+  if [[ -f /etc/dnsmasq.conf ]] && ! grep -Eq '^conf-dir=/etc/dnsmasq\.d' /etc/dnsmasq.conf; then
+    backup_file /etc/dnsmasq.conf
+    printf '\n# Managed by %s\nconf-dir=/etc/dnsmasq.d/,*.conf\n' "$SCRIPT_NAME" >> /etc/dnsmasq.conf
+  fi
   backup_file /etc/dnsmasq.d/custom_ai.conf
 
   {
@@ -226,18 +329,18 @@ configure_dnsmasq_ai() {
 
   dnsmasq --test
   if [[ "$NO_RESTART" -eq 0 ]]; then
-    systemctl enable dnsmasq >/dev/null || true
-    systemctl restart dnsmasq
+    svc_enable dnsmasq
+    svc_restart dnsmasq
   fi
   log "dnsmasq AI rules written to /etc/dnsmasq.d/custom_ai.conf"
 }
 
 configure_nginx_stream() {
-  apt_install nginx libnginx-mod-stream curl
+  install_nginx_packages
 
-  if systemctl list-unit-files sniproxy.service >/dev/null 2>&1; then
+  if svc_exists sniproxy; then
     warn "Disabling sniproxy; nginx stream will replace it for SNI forwarding."
-    systemctl disable --now sniproxy || true
+    svc_stop_disable sniproxy
   fi
 
   backup_file /etc/nginx/nginx.conf
@@ -247,34 +350,78 @@ configure_nginx_stream() {
 from pathlib import Path
 p = Path('/etc/nginx/nginx.conf')
 s = p.read_text()
-line = 'include /etc/nginx/stream-conf.d/*.conf;'
-if line not in s:
-    p.write_text(s.rstrip() + '\n\n# SNI unlock stream configs\n' + line + '\n')
+# Alpine packages ship stream as a dynamic module and usually load it via
+# /etc/nginx/modules/*.conf. Only add an explicit load_module if no module
+# include is present; otherwise nginx fails with "module is already loaded".
+module_candidates = [
+    '/usr/lib/nginx/modules/ngx_stream_module.so',
+    '/etc/nginx/modules/ngx_stream_module.so',
+    '/usr/share/nginx/modules/ngx_stream_module.so',
+]
+module = next((m for m in module_candidates if Path(m).exists()), None)
+already_loads_modules_dir = 'include /etc/nginx/modules/*.conf;' in s or 'include modules/*.conf;' in s
+if module and 'ngx_stream_module.so' not in s and not already_loads_modules_dir:
+    s = f'load_module {module};\n' + s
+p.write_text(s)
 PY
 
-  cat > /etc/nginx/stream-conf.d/ai-unlock.conf <<'EOF'
-stream {
-    resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
-    resolver_timeout 5s;
+  python3 - <<'PY'
+from pathlib import Path
 
-    log_format sni_unlock '$remote_addr [$time_local] $ssl_preread_server_name -> $upstream_addr status=$status sent=$bytes_sent received=$bytes_received time=$session_time';
-    access_log /var/log/nginx/sni-unlock-access.log sni_unlock;
-    error_log /var/log/nginx/sni-unlock-error.log notice;
+# Alpine nginx has /etc/nginx/conf.d/stream.conf with:
+#   stream { include stream.d/*.conf; }
+# Debian/Ubuntu usually does not, so we add a top-level stream block include.
+nginx_conf = Path('/etc/nginx/nginx.conf')
+conf_text = nginx_conf.read_text()
+stream_conf = Path('/etc/nginx/conf.d/stream.conf')
+use_existing_stream_context = False
+if stream_conf.exists():
+    st = stream_conf.read_text()
+    if 'stream {' in st and ('include stream.d/*.conf;' in st or 'include /etc/nginx/stream.d/*.conf;' in st):
+        use_existing_stream_context = True
 
-    server {
-        listen 0.0.0.0:443 reuseport;
-        ssl_preread on;
-        proxy_connect_timeout 10s;
-        proxy_timeout 300s;
-        proxy_pass $ssl_preread_server_name:443;
-    }
+inner_config = """
+resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+resolver_timeout 5s;
+
+log_format sni_unlock '$remote_addr [$time_local] $ssl_preread_server_name -> $upstream_addr status=$status sent=$bytes_sent received=$bytes_received time=$session_time';
+access_log /var/log/nginx/sni-unlock-access.log sni_unlock;
+error_log /var/log/nginx/sni-unlock-error.log notice;
+
+server {
+    listen 0.0.0.0:443 reuseport;
+    ssl_preread on;
+    proxy_connect_timeout 10s;
+    proxy_timeout 300s;
+    proxy_pass $ssl_preread_server_name:443;
 }
-EOF
+""".lstrip()
+
+if use_existing_stream_context:
+    target_dir = Path('/etc/nginx/stream.d')
+    target_dir.mkdir(parents=True, exist_ok=True)
+    Path('/etc/nginx/stream.d/ai-unlock.conf').write_text(inner_config)
+    # Remove old top-level config if a previous run created it.
+    old = Path('/etc/nginx/stream-conf.d/ai-unlock.conf')
+    if old.exists():
+        old.unlink()
+    marker = 'include /etc/nginx/stream-conf.d/*.conf;'
+    if marker in conf_text:
+        lines = [ln for ln in conf_text.splitlines() if marker not in ln and 'SNI unlock stream configs' not in ln]
+        nginx_conf.write_text('\n'.join(lines).rstrip() + '\n')
+else:
+    target_dir = Path('/etc/nginx/stream-conf.d')
+    target_dir.mkdir(parents=True, exist_ok=True)
+    Path('/etc/nginx/stream-conf.d/ai-unlock.conf').write_text('stream {\n' + ''.join('    '+line if line.strip() else line for line in inner_config.splitlines(True)) + '}\n')
+    marker = 'include /etc/nginx/stream-conf.d/*.conf;'
+    if marker not in conf_text:
+        nginx_conf.write_text(conf_text.rstrip() + '\n\n# SNI unlock stream configs\n' + marker + '\n')
+PY
 
   nginx -t
   if [[ "$NO_RESTART" -eq 0 ]]; then
-    systemctl enable nginx >/dev/null || true
-    systemctl restart nginx
+    svc_enable nginx
+    svc_restart nginx
   fi
   log "nginx stream SNI proxy configured on 0.0.0.0:443"
 }
@@ -317,8 +464,8 @@ verify_unlock_server() {
   fi
 
   log "Service status summary:"
-  systemctl is-active dnsmasq || true
-  systemctl is-active nginx || true
+  svc_is_active dnsmasq
+  svc_is_active nginx
 }
 
 patch_singbox_client() {
@@ -387,6 +534,10 @@ singbox_check_and_restart() {
   elif [[ -x /usr/local/bin/sing-box ]]; then
     sb="/usr/local/bin/sing-box"
   else
+    if [[ "$NO_RESTART" -eq 1 ]]; then
+      warn "sing-box binary not found; skipped config check because --no-restart is set."
+      return 0
+    fi
     die "sing-box binary not found."
   fi
 
@@ -402,13 +553,13 @@ singbox_check_and_restart() {
   "${check_cmd[@]}"
 
   if [[ "$NO_RESTART" -eq 0 ]]; then
-    if systemctl list-unit-files sing-box.service >/dev/null 2>&1; then
-      systemctl restart sing-box
+    if svc_exists sing-box; then
+      svc_restart sing-box
       sleep 1
-      systemctl is-active sing-box
+      svc_is_active sing-box
       log "sing-box restarted."
     else
-      warn "sing-box.service not found; config checked but service not restarted."
+      warn "sing-box service not found; config checked but service not restarted."
     fi
   fi
 }
