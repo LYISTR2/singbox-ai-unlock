@@ -1,13 +1,49 @@
-# singbox-ai-unlock：sing-box AI 解锁分流一键脚本
+# singbox-ai-unlock：sing-box AI 分流到 Shadowsocks 出口的一键脚本
 
-这个仓库提供一个一键脚本，用来把 **sing-box 节点中的指定 AI 服务流量** 分流到另一台 **解锁/出口 VPS**。
+这个仓库现在提供的是 **sing-box 客户端/节点侧分流脚本**。
 
-适用场景：
+它不再依赖：
 
-- 你有一台 sing-box 节点 VPS，用户设备连这台节点；
-- 你另有一台地区/IP 更适合访问 ChatGPT、Claude、Gemini 等服务的 VPS；
-- 希望只有 AI 域名走解锁 VPS，其他网站仍然保持原来的 sing-box 出口；
-- 不想把整台机器系统 DNS 全局改掉。
+- `dnsmasq` 把 AI 域名劫持到解锁端；
+- `nginx stream` 按 SNI 透明转发；
+- 解锁端额外部署 DNS + SNI 透明代理。
+
+现在的新逻辑更直接：
+
+```text
+用户设备
+  -> 连接你的 sing-box 节点 VPS
+  -> sing-box 判断目标域名
+  -> 普通网站：按你原来的出口规则走
+  -> AI 域名：走你输入的 Shadowsocks 出口节点
+```
+
+这个方案更适合：
+
+- ChatGPT App
+- ChatGPT 网页版
+- Claude
+- Gemini
+- 其他对 TLS / 证书 / App 网络环境更敏感的 AI 服务
+
+因为它不再把 AI 域名解析成“解锁端 IP”，而是让连接正常解析真实域名，再通过 sing-box 的 Shadowsocks outbound 出站。
+
+---
+
+## 适用场景
+
+适合你已经有：
+
+- 一台 sing-box 节点 VPS；
+- 一个可用的 Shadowsocks 节点，作为 AI 服务专用出口；
+- 希望只有 AI 域名走这个 SS 出口，其他流量保持原样。
+
+不适合：
+
+- 你想自动部署解锁端的 `dnsmasq + nginx stream`；
+- 你需要脚本帮你在出口 VPS 上搭建透明 SNI 代理。
+
+这个仓库现在**不再做解锁端部署**，只负责 **sing-box 客户端/节点侧自动分流**。
 
 ---
 
@@ -15,35 +51,41 @@
 
 ```text
 用户设备
-  -> 连接 sing-box VPS 的代理端口
-  -> sing-box 判断目标域名
-  -> 普通网站：照旧直连或按你原来的规则走
-  -> AI 域名：
-       1. DNS 查询发到解锁 VPS
-       2. AI 域名解析为解锁 VPS 的 IP
-       3. TCP 443 直连解锁 VPS
-       4. 解锁 VPS 上的 nginx stream 读取 TLS SNI
-       5. nginx stream 按 SNI 转发到真实 AI 服务
+  -> 连入 sing-box 节点 VPS
+  -> sing-box 匹配域名
+  -> 普通流量：继续走原来的规则
+  -> AI 域名：走新建的 Shadowsocks outbound
+  -> 由你输入的 SS 节点作为出口访问 ChatGPT / Claude / Gemini
 ```
 
-重点：**DNS 只是把 AI 域名导向解锁 VPS，真正让目标服务看到解锁 VPS 出口 IP 的，是解锁 VPS 上的 TCP 443 SNI 转发。**
+同时脚本会：
+
+- 为 AI 域名添加路由规则；
+- 阻断 AI 域名的 `UDP 443`；
+- 强制这些域名回落到 TCP 443，避免 QUIC / HTTP3 绕过代理分流。
 
 ---
 
 ## 支持系统
 
-当前脚本已测试/适配：
+当前脚本运行在 **sing-box 节点 VPS** 上，已按常见 Linux 环境设计：
 
-- Debian / Ubuntu：使用 `apt-get` + `systemd`
-- Alpine Linux：使用 `apk` + OpenRC
+- Debian / Ubuntu
+- 其他能运行 `bash + python3 + sing-box` 的 Linux 系统
 
-如果你的系统不是上述类型，脚本会提示不支持。
+脚本本身不依赖包管理器安装组件，因为它不再负责搭解锁端服务。
+
+要求环境里已有：
+
+- `bash`
+- `python3`
+- `sing-box`
 
 ---
 
 ## 一键下载脚本
 
-在需要配置的 VPS 上执行：
+在你的 sing-box 节点 VPS 上执行：
 
 ```bash
 wget -O ai_singbox_unlock_setup.sh https://raw.githubusercontent.com/LYISTR2/singbox-ai-unlock/main/ai_singbox_unlock_setup.sh
@@ -59,161 +101,217 @@ chmod +x ai_singbox_unlock_setup.sh
 
 ---
 
-## 部署步骤总览
+## 你需要准备什么
 
-需要在两台机器上分别执行：
+你需要准备一个 **可用的 Shadowsocks 出口节点**。
 
-1. **解锁端 VPS**：运行 `unlock-server` 模式；
-2. **sing-box 客户端/节点 VPS**：运行 `singbox-client` 模式。
+脚本支持两种输入方式：
 
----
+### 方式 1：直接输入完整 `ss://` 链接
 
-# 第一步：配置解锁端 VPS
-
-在你准备用作 AI 出口的 VPS 上运行：
-
-```bash
-bash ai_singbox_unlock_setup.sh unlock-server
-```
-
-脚本会交互式询问：
+例如：
 
 ```text
-Enter unlock/exit VPS public IPv4:
-Enter sing-box client VPS public IPv4 allowed to use this unlock endpoint:
+ss://BASE64编码内容@1.2.3.4:443#JP
 ```
 
-含义：
+或者常见的 SS2022 节点格式。
 
-- `unlock/exit VPS public IPv4`：当前这台解锁 VPS 的公网 IPv4；
-- `sing-box client VPS public IPv4`：允许访问这个解锁端的 sing-box 节点 VPS 公网 IPv4。
+### 方式 2：手动输入 4 个参数
 
-脚本会做这些事：
+- `server`
+- `port`
+- `method`
+- `password`
 
-- 安装 `dnsmasq`；
-- 安装 `nginx` 和 `nginx stream` 模块；
-- 生成 `/etc/dnsmasq.d/custom_ai.conf`；
-- 让 AI 域名解析到解锁 VPS IP；
-- 停用可能有问题的 `sniproxy`；
-- 用 `nginx stream ssl_preread` 监听 TCP 443；
-- 根据 TLS SNI 转发到真实目标域名；
-- 默认用 iptables 限制只有 sing-box 客户端 IP 能访问 `53/80/443`；
-- 如果系统支持，会持久化 iptables 规则。
+例如：
 
-## 解锁端非交互式用法
-
-也可以直接带参数：
-
-```bash
-bash ai_singbox_unlock_setup.sh unlock-server \
-  --unlock-ip <UNLOCK_VPS_IP> \
-  --client-ip <SINGBOX_CLIENT_IP>
+```text
+server: 1.2.3.4
+port: 20021
+method: 2022-blake3-aes-256-gcm
+password: xxxxxxxxxx
 ```
-
-例如你以后自己替换成真实 IP 即可：
-
-```bash
-bash ai_singbox_unlock_setup.sh unlock-server \
-  --unlock-ip <你的解锁端公网IP> \
-  --client-ip <你的sing-box节点公网IP>
-```
-
-## 如果不想让脚本修改防火墙
-
-```bash
-bash ai_singbox_unlock_setup.sh unlock-server --no-firewall
-```
-
-如果使用 `--no-firewall`，请你自己确保：
-
-- sing-box 客户端 VPS 可以访问解锁端 `53/tcp` 或 `53/udp`；
-- sing-box 客户端 VPS 可以访问解锁端 `443/tcp`；
-- 不要把 DNS 和通配 SNI 代理无限制暴露给全网。
 
 ---
 
-# 第二步：配置 sing-box 客户端/节点 VPS
+## 最常用用法：交互式运行
 
-在运行 sing-box 节点的 VPS 上执行：
+在 sing-box 节点 VPS 上执行：
 
 ```bash
 bash ai_singbox_unlock_setup.sh singbox-client
 ```
 
-脚本会交互式询问：
+脚本会依次询问：
 
 ```text
-Enter unlock/exit VPS public IPv4:
 sing-box config path [/usr/local/etc/sing-box/config.json]:
 optional relay config path; leave default if present [/usr/local/etc/sing-box/relay.json]:
-DNS transport to unlock VPS, tcp or udp [tcp]:
+AI outbound tag [ai-unlock-ss]:
+optional outbound detour tag; leave empty for none:
+Paste full ss:// node; leave empty to input manually:
 ```
 
-建议：
+如果你粘贴了完整 `ss://` 节点，脚本会自动解析：
 
-- 不确定 DNS 传输方式时直接回车，默认用 `tcp`；
-- 如果你确认解锁端 UDP 53 对客户端可用，可以填 `udp`；
-- 大多数 sing-box 安装脚本配置路径是 `/usr/local/etc/sing-box/config.json`，默认直接回车即可。
+- 服务器地址
+- 端口
+- 加密方式
+- 密码
 
-脚本会做这些事：
+如果你把 `ss://` 留空，脚本会继续问你：
 
-- 备份原 sing-box 配置；
-- 添加 `ai-unlock-dns` DNS 服务器；
-- 让 AI 域名 DNS 查询走解锁 VPS；
-- 让 AI 域名连接走 `direct`；
-- 阻断 AI 域名的 `UDP 443`，避免 QUIC / HTTP3 绕过 TCP SNI 代理；
+```text
+Shadowsocks server / hostname:
+Shadowsocks port:
+Shadowsocks method (example: 2022-blake3-aes-256-gcm):
+Shadowsocks password:
+```
+
+输入完成后，脚本会自动：
+
+- 备份你的 sing-box 主配置；
+- 删除旧的 `ai-unlock-dns` DNS 劫持规则；
+- 新增一个 Shadowsocks outbound；
+- 把 AI 域名改成走这个 outbound；
+- 保留 AI 域名 `UDP 443 -> block` 规则；
 - 执行 `sing-box check`；
 - 重启 sing-box 服务。
 
-## sing-box 客户端非交互式用法
+---
+
+## 非交互式用法
+
+### 用完整 `ss://` 节点
 
 ```bash
 bash ai_singbox_unlock_setup.sh singbox-client \
-  --unlock-ip <UNLOCK_VPS_IP> \
-  --config /usr/local/etc/sing-box/config.json
+  --ss-url 'ss://BASE64@1.2.3.4:443#JP'
 ```
 
-如果解锁端 DNS 使用 UDP：
+### 手动指定 Shadowsocks 参数
 
 ```bash
 bash ai_singbox_unlock_setup.sh singbox-client \
-  --unlock-ip <UNLOCK_VPS_IP> \
-  --dns-transport udp
+  --server 1.2.3.4 \
+  --port 20021 \
+  --method 2022-blake3-aes-256-gcm \
+  --password 'YOUR_PASSWORD'
 ```
+
+### 指定 sing-box 配置文件路径
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://BASE64@1.2.3.4:443#JP' \
+  --config /usr/local/etc/sing-box/config.json \
+  --relay-config /usr/local/etc/sing-box/relay.json
+```
+
+### 指定 outbound tag
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://BASE64@1.2.3.4:443#JP' \
+  --tag ai-jp-ss
+```
+
+### 指定 detour
+
+如果你希望这个 SS outbound 自己再挂到某个已有出口 tag 上，可以加：
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://BASE64@1.2.3.4:443#JP' \
+  --outbound-detour direct
+```
+
+大多数场景留空即可。
+
+### 只改配置，不重启 sing-box
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://BASE64@1.2.3.4:443#JP' \
+  --no-restart
+```
+
+适合你想先改好配置，自己手动检查后再重启。
 
 ---
 
-## 完整参数说明
+## `parse-ss` 模式
+
+如果你只是想检查某个 `ss://` 链接到底解析成什么，可以用：
+
+```bash
+bash ai_singbox_unlock_setup.sh parse-ss --ss-url 'ss://BASE64@1.2.3.4:443#JP'
+```
+
+脚本会输出：
 
 ```text
-unlock-server 模式：
-  --unlock-ip <IP>       解锁端 VPS 公网 IPv4
-  --client-ip <IP>       允许使用解锁端的 sing-box 节点公网 IPv4
-  --no-firewall          不修改 iptables
-  --no-restart           只写配置，不重启服务
+server=...
+port=...
+method=...
+password=...
+```
 
-singbox-client 模式：
-  --unlock-ip <IP>       解锁端 VPS 公网 IPv4
-  --config <路径>        sing-box 主配置路径，默认 /usr/local/etc/sing-box/config.json
-  --relay-config <路径>  第二配置文件路径，默认 /usr/local/etc/sing-box/relay.json
-  --dns-transport tcp|udp 访问解锁端 DNS 的方式，默认 tcp
-  --no-restart           只修改并检查配置，不重启 sing-box
+这个模式只做解析，不改任何配置。
+
+---
+
+## 脚本会修改什么
+
+脚本只修改：
+
+```text
+你的 sing-box 主配置文件
+```
+
+默认是：
+
+```text
+/usr/local/etc/sing-box/config.json
+```
+
+修改前会自动备份，例如：
+
+```text
+/usr/local/etc/sing-box/config.json.bak.20260614-xxxxxx
 ```
 
 ---
 
-## 脚本内置的 AI 域名
+## 脚本会自动清理的旧逻辑
 
-当前包含：
+如果你之前用过旧版 DNS 劫持 + SNI 解锁方案，脚本会自动清理：
+
+- `ai-unlock-dns` 这个 DNS server；
+- AI 域名走 `ai-unlock-dns` 的 DNS 规则；
+- 旧的 AI 分流生成规则（`direct` / `block` / `ai-unlock-ss` 旧版本）。
+
+也就是说，它会把仓库旧方案迁移成现在的新方案。
+
+---
+
+## 内置 AI 域名列表
+
+当前脚本内置以下域名：
 
 ```text
 openai.com
 chatgpt.com
+chat.openai.com
 auth.openai.com
 auth0.openai.com
 api.openai.com
 oaistatic.com
+cdn.oaistatic.com
+persistent.oaistatic.com
 oaiusercontent.com
+files.oaiusercontent.com
 featuregates.org
 statsig.com
 statsigapi.net
@@ -237,65 +335,74 @@ bing.com
 edgeservices.bing.com
 ```
 
-如果后续发现某个服务资源加载不全，可以编辑脚本里的 `AI_DOMAINS` 数组再运行。
+如果以后你发现某个服务资源没走代理，可以编辑脚本里的数组后重新运行。
 
 ---
 
 ## 验证方法
 
-## 在解锁端 VPS 上验证
+### 1. 检查 sing-box 配置是否通过
+
+脚本运行时会自动执行：
 
 ```bash
-ss -lntup | grep -E ':(53|80|443)\b'
+sing-box check -c <config> [-c <relay-config>]
 ```
 
-应该能看到类似：
+如果这里报错，说明配置没通过，脚本会直接停止。
+
+---
+
+### 2. 检查 Shadowsocks 节点端口是否可达
+
+脚本运行时会自动测试：
+
+```bash
+TCP <port> open on <server>
+```
+
+如果看到：
 
 ```text
-dnsmasq 监听 53
-nginx   监听 443
+Cannot reach <server>:<port>
 ```
 
-测试 DNS：
+说明你的 sing-box 节点 VPS 当前访问不到这个 SS 节点。
+
+---
+
+### 3. 查看 sing-box 日志
+
+你可以手动查看：
 
 ```bash
-dig +tcp chatgpt.com @127.0.0.1 +short
-dig +tcp claude.ai @127.0.0.1 +short
+journalctl -u sing-box -f
 ```
 
-返回应该是你的解锁端 IP。
-
-## 在 sing-box 客户端 VPS 上验证
-
-测试能否连到解锁端 443：
-
-```bash
-timeout 5 bash -c '</dev/tcp/<UNLOCK_VPS_IP>/443' && echo ok
-```
-
-测试解锁端 DNS：
-
-```bash
-dig +tcp chatgpt.com @<UNLOCK_VPS_IP> +short
-dig +tcp claude.ai @<UNLOCK_VPS_IP> +short
-```
-
-如果你使用 UDP DNS，则改成：
-
-```bash
-dig chatgpt.com @<UNLOCK_VPS_IP> +short
-```
-
-通过 sing-box 实际访问时，可以查看 sing-box 日志，应该能看到：
+当客户端访问 ChatGPT / Claude / Gemini 时，应该能看到类似：
 
 ```text
-inbound connection to chatgpt.com:443
-router: match domain_suffix ... => route(direct)
-dns: match domain_suffix ... => route(ai-unlock-dns)
-A chatgpt.com -> <UNLOCK_VPS_IP>
+router: match domain_suffix=[openai.com chatgpt.com ...] => route(ai-unlock-ss)
+outbound/shadowsocks[ai-unlock-ss]: outbound connection to chatgpt.com:443
 ```
 
-如果 curl 返回类似下面内容，说明链路已经到 ChatGPT，只是触发了 Cloudflare 验证：
+如果你自定义了 `--tag`，日志里会显示你自己的 tag 名称。
+
+---
+
+### 4. 实际访问测试
+
+客户端连到你的 sing-box 节点后，直接访问：
+
+```text
+https://chatgpt.com
+https://claude.ai
+https://gemini.google.com
+```
+
+如果网页能打开或至少返回真实站点响应，而不是本地网络错误，就说明分流已经生效。
+
+对于 ChatGPT，常见正确现象是返回 Cloudflare challenge，例如：
 
 ```text
 HTTP/2 403
@@ -303,89 +410,109 @@ server: cloudflare
 cf-mitigated: challenge
 ```
 
-这不是网络失败。
+这通常表示链路已经走通，只是 Cloudflare 触发了风控挑战，不是节点本身失败。
 
 ---
 
 ## 回滚方法
 
-脚本修改重要文件前会自动备份，例如：
+如果你想回滚到脚本执行前状态：
 
-```text
-/usr/local/etc/sing-box/config.json.bak.YYYYMMDD-HHMMSS
-/etc/nginx/nginx.conf.bak.YYYYMMDD-HHMMSS
-/etc/dnsmasq.d/custom_ai.conf.bak.YYYYMMDD-HHMMSS
-/etc/dnsmasq.conf.bak.YYYYMMDD-HHMMSS
-```
+1. 找到脚本生成的备份文件；
+2. 覆盖回原配置；
+3. 重启 sing-box。
 
-需要回滚时，把对应备份复制回原路径，然后重启相关服务即可。
-
-例如回滚 sing-box 配置：
+例如：
 
 ```bash
-cp /usr/local/etc/sing-box/config.json.bak.YYYYMMDD-HHMMSS /usr/local/etc/sing-box/config.json
+cp /usr/local/etc/sing-box/config.json.bak.20260614-xxxxxx /usr/local/etc/sing-box/config.json
 systemctl restart sing-box
-```
-
-Alpine/OpenRC 系统则可能是：
-
-```bash
-rc-service sing-box restart
 ```
 
 ---
 
 ## 常见问题
 
-## 1. 为什么不用 sniproxy？
+### 1. 为什么现在不再做 DNS 劫持 + nginx SNI？
 
-一些发行版的 `sniproxy` 包没有编译 `libudns`，会导致通配后端配置失败，例如：
+因为这个方案对网页版有时可用，但对 App，尤其是 ChatGPT App，容易出现：
 
-```text
-Only socket address backends are permitted when compiled without libudns
-```
+- SSL 证书异常；
+- 网络配置错误；
+- 某些子域名没覆盖完全；
+- QUIC / HTTP3 绕过；
+- App 比浏览器更严格的证书和网络检查。
 
-所以脚本改用 `nginx stream ssl_preread`，更稳定。
+Shadowsocks 出口分流更直接，也更稳定。
 
-## 2. 为什么要阻断 UDP 443？
+---
 
-浏览器和客户端可能使用 QUIC / HTTP3，也就是 UDP 443。
+### 2. 为什么还要阻断 UDP 443？
 
-但 nginx stream SNI 转发处理的是 TCP 443。如果不阻断 UDP 443，部分请求可能绕过解锁链路。
+因为很多 App / 浏览器会优先尝试 HTTP/3 / QUIC。
 
-所以脚本会在 sing-box 里对 AI 域名添加 UDP 443 block 规则。
-
-## 3. 为什么默认 DNS 用 TCP？
-
-有些 VPS 或防火墙环境下 UDP 53 容易被拦截，但 TCP 53 可用。
-
-为了稳定，sing-box 客户端模式默认使用：
+如果 AI 域名走了 UDP 443，可能绕开你配置的 TCP 代理分流逻辑。所以脚本保留：
 
 ```text
-tcp://<UNLOCK_VPS_IP>
+AI 域名 + UDP 443 -> block
 ```
 
-如果你确认 UDP 53 可用，可以指定：
+让它回落到 TCP 443。
+
+---
+
+### 3. 如果我的 SS 节点不是直接公网出口，而是另一个链式出口怎么办？
+
+可以尝试给 outbound 加上：
 
 ```bash
---dns-transport udp
+--outbound-detour <已有tag>
 ```
 
-## 4. 为什么访问 ChatGPT 仍然出现 Cloudflare 验证？
+但这取决于你自己的 sing-box 架构。大多数情况下不需要。
 
-Cloudflare 验证页说明请求已经到达 ChatGPT/Cloudflare。是否触发验证取决于浏览器环境、IP 信誉、Cookie、指纹等因素，不代表分流失败。
+---
 
-## 5. 解锁端是否应该开放给全网？
+### 4. 脚本支持 VLESS / Trojan / Hysteria 吗？
 
-不建议。
+当前版本只支持：
 
-通配 SNI 转发如果开放给全网，可能被别人滥用。脚本默认会用 iptables 限制 `53/80/443` 只允许你指定的 sing-box 客户端 IP 访问。
+```text
+Shadowsocks
+```
+
+尤其是标准 `ss://` 链接和 SS2022 参数。
+
+如果你后续需要扩展到 VLESS / Trojan，可以再加解析和 outbound 生成逻辑。
+
+---
+
+### 5. `parse-ss` 输出了密码，这安全吗？
+
+`parse-ss` 本来就是调试模式，会把节点内容直接解析显示出来。所以：
+
+- 只在你自己机器上用；
+- 不要把输出贴到公开地方；
+- 不要把真实节点写进 GitHub README。
 
 ---
 
 ## 安全建议
 
-- 不要把 SSH 密码、GitHub Token 发到公开环境；
-- 解锁端只放行可信客户端 IP；
-- 如果客户端公网 IP 变化，需要重新运行 `unlock-server` 模式或手动更新 iptables；
-- 建议使用 SSH key 登录 VPS，并关闭密码登录。
+- 不要把真实 `ss://` 节点直接写进公开仓库；
+- 不要把真实 IP、密码、token、私钥写进 README；
+- 调试完记得检查 shell 历史记录里有没有敏感命令；
+- 如果某个节点已经在聊天中泄露，建议后续更换密码或整条节点。
+
+---
+
+## 当前仓库定位
+
+这个仓库现在的定位很明确：
+
+```text
+不负责搭出口 VPS；
+只负责把 sing-box 节点中的 AI 域名自动分流到你输入的 Shadowsocks 出口。
+```
+
+如果你已经有可用的 SS 出口节点，这个脚本就能直接拿来用。

@@ -1,35 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# AI sing-box unlock helper
-# Modes:
-#   unlock-server  : configure dnsmasq + nginx stream SNI proxy on the exit/unlock VPS
-#   singbox-client : patch sing-box client/server config so selected AI domains resolve to unlock VPS and route direct
-#
-# Example:
-#   bash ai_singbox_unlock_setup.sh unlock-server
-#   bash ai_singbox_unlock_setup.sh singbox-client
-#
-# You can pass IPs via flags or enter them interactively when prompted.
-
 SCRIPT_NAME="$(basename "$0")"
 MODE=""
-UNLOCK_IP=""
-CLIENT_IP=""
 SINGBOX_CONFIG="/usr/local/etc/sing-box/config.json"
 SINGBOX_RELAY_CONFIG="/usr/local/etc/sing-box/relay.json"
-NO_FIREWALL=0
 NO_RESTART=0
-DNS_TRANSPORT="tcp"   # tcp is safer when UDP/53 is filtered; values: tcp|udp
+SS_URL=""
+SS_SERVER=""
+SS_PORT=""
+SS_METHOD=""
+SS_PASSWORD=""
+OUTBOUND_TAG="ai-unlock-ss"
+OUTBOUND_DETOUR=""
 
 AI_DOMAINS=(
   openai.com
   chatgpt.com
+  chat.openai.com
   auth.openai.com
   auth0.openai.com
   api.openai.com
   oaistatic.com
+  cdn.oaistatic.com
+  persistent.oaistatic.com
   oaiusercontent.com
+  files.oaiusercontent.com
   featuregates.org
   statsig.com
   statsigapi.net
@@ -58,38 +54,34 @@ die() { err "$*"; exit 1; }
 usage() {
   cat <<EOF
 Usage:
-  $SCRIPT_NAME unlock-server  --unlock-ip <EXIT_IP> --client-ip <CLIENT_IP> [--no-firewall] [--no-restart]
-  $SCRIPT_NAME singbox-client --unlock-ip <EXIT_IP> [--config <config.json>] [--relay-config <relay.json>] [--dns-transport tcp|udp] [--no-restart]
+  $SCRIPT_NAME singbox-client [options]
+  $SCRIPT_NAME parse-ss --ss-url <ss://...>
 
 Modes:
-  unlock-server
-    Configure the exit VPS:
-      - install dnsmasq, dnsutils, nginx, libnginx-mod-stream
-      - write /etc/dnsmasq.d/custom_ai.conf so AI domains resolve to EXIT_IP
-      - disable broken sniproxy, replace with nginx stream ssl_preread SNI proxy on 443
-      - optionally restrict 53/80/443 to CLIENT_IP using iptables and persist rules if possible
-
   singbox-client
-    Patch a sing-box config:
-      - add DNS server ai-unlock-dns => tcp://EXIT_IP or udp://EXIT_IP
-      - DNS-rule AI domains to ai-unlock-dns
-      - route AI domains to direct
-      - block AI UDP/443 to avoid QUIC bypass
-      - backup original config before editing
+    Patch a sing-box config so selected AI domains go through a Shadowsocks outbound.
+    If parameters are omitted, the script will prompt interactively.
+
+  parse-ss
+    Decode a Shadowsocks URI and print server / port / method / password.
+
+Options for singbox-client:
+  --ss-url <ss://...>          Full Shadowsocks URI.
+  --server <host>              Shadowsocks server / hostname.
+  --port <port>                Shadowsocks port.
+  --method <cipher>            Shadowsocks method, for example 2022-blake3-aes-256-gcm.
+  --password <password>        Shadowsocks password.
+  --config <path>              sing-box main config path. Default: /usr/local/etc/sing-box/config.json
+  --relay-config <path>        optional second config path. Default: /usr/local/etc/sing-box/relay.json
+  --tag <name>                 outbound tag to create. Default: ai-unlock-ss
+  --outbound-detour <tag>      optional detour tag for the Shadowsocks outbound.
+  --no-restart                 patch and check config only, do not restart sing-box.
 
 Examples:
-  # Interactive mode on unlock VPS / exit VPS:
-  bash $SCRIPT_NAME unlock-server
-
-  # Interactive mode on sing-box client/server VPS:
   bash $SCRIPT_NAME singbox-client
-
-  # Non-interactive mode:
-  bash $SCRIPT_NAME unlock-server --unlock-ip <UNLOCK_VPS_IP> --client-ip <SINGBOX_CLIENT_IP>
-  bash $SCRIPT_NAME singbox-client --unlock-ip <UNLOCK_VPS_IP> --config /usr/local/etc/sing-box/config.json
-
-  # If your unlock DNS supports UDP/53 from the client:
-  bash $SCRIPT_NAME singbox-client --unlock-ip <UNLOCK_VPS_IP> --dns-transport udp
+  bash $SCRIPT_NAME singbox-client --ss-url 'ss://BASE64@1.2.3.4:443#JP'
+  bash $SCRIPT_NAME singbox-client --server example.com --port 443 --method 2022-blake3-aes-256-gcm --password 'YOUR_PASSWORD'
+  bash $SCRIPT_NAME parse-ss --ss-url 'ss://BASE64@1.2.3.4:443#JP'
 EOF
 }
 
@@ -101,82 +93,105 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
-valid_ipish() {
-  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
 }
 
 prompt_value() {
   local var_name="$1"
   local prompt="$2"
   local default="${3:-}"
+  local secret="${4:-0}"
   local value=""
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " value
-    value="${value:-$default}"
-  else
-    while [[ -z "$value" ]]; do
-      read -r -p "$prompt: " value
-    done
-  fi
+  while true; do
+    if [[ -n "$default" ]]; then
+      if [[ "$secret" == "1" ]]; then
+        read -r -s -p "$prompt [$default]: " value
+        echo
+      else
+        read -r -p "$prompt [$default]: " value
+      fi
+      value="${value:-$default}"
+    else
+      if [[ "$secret" == "1" ]]; then
+        read -r -s -p "$prompt: " value
+        echo
+      else
+        read -r -p "$prompt: " value
+      fi
+    fi
+    [[ -n "$value" ]] && break
+  done
   printf -v "$var_name" '%s' "$value"
 }
 
-prompt_ip() {
+prompt_optional() {
   local var_name="$1"
   local prompt="$2"
+  local default="${3:-}"
   local value=""
-  while true; do
-    prompt_value value "$prompt" ""
-    if valid_ipish "$value"; then
-      printf -v "$var_name" '%s' "$value"
-      return 0
-    fi
-    warn "Invalid IPv4 address: $value"
-  done
+  read -r -p "$prompt${default:+ [$default]}: " value
+  value="${value:-$default}"
+  printf -v "$var_name" '%s' "$value"
 }
 
 interactive_fill_missing() {
-  # If stdin is not a TTY, keep strict non-interactive behavior.
   [[ -t 0 ]] || return 0
-
-  if [[ -z "$UNLOCK_IP" ]]; then
-    prompt_ip UNLOCK_IP "Enter unlock/exit VPS public IPv4"
-  fi
-
-  if [[ "$MODE" == "unlock-server" && -z "$CLIENT_IP" ]]; then
-    prompt_ip CLIENT_IP "Enter sing-box client VPS public IPv4 allowed to use this unlock endpoint"
-  fi
 
   if [[ "$MODE" == "singbox-client" ]]; then
     local answer=""
-    prompt_value answer "sing-box config path" "$SINGBOX_CONFIG"
+    prompt_optional answer "sing-box config path" "$SINGBOX_CONFIG"
     SINGBOX_CONFIG="$answer"
 
-    prompt_value answer "optional relay config path; leave default if present" "$SINGBOX_RELAY_CONFIG"
+    prompt_optional answer "optional relay config path; leave default if present" "$SINGBOX_RELAY_CONFIG"
     SINGBOX_RELAY_CONFIG="$answer"
 
-    prompt_value answer "DNS transport to unlock VPS, tcp or udp" "$DNS_TRANSPORT"
-    DNS_TRANSPORT="$answer"
+    prompt_optional answer "AI outbound tag" "$OUTBOUND_TAG"
+    OUTBOUND_TAG="$answer"
+
+    prompt_optional answer "optional outbound detour tag; leave empty for none" "$OUTBOUND_DETOUR"
+    OUTBOUND_DETOUR="$answer"
+
+    if [[ -z "$SS_URL" && -z "$SS_SERVER" ]]; then
+      prompt_optional answer "Paste full ss:// node; leave empty to input manually" ""
+      SS_URL="$answer"
+    fi
+
+    if [[ -z "$SS_URL" && -z "$SS_SERVER" ]]; then
+      prompt_value SS_SERVER "Shadowsocks server / hostname"
+      while true; do
+        prompt_value SS_PORT "Shadowsocks port"
+        valid_port "$SS_PORT" && break
+        warn "Invalid port: $SS_PORT"
+      done
+      prompt_value SS_METHOD "Shadowsocks method (example: 2022-blake3-aes-256-gcm)"
+      prompt_value SS_PASSWORD "Shadowsocks password" "" 1
+    fi
   fi
 }
 
 parse_args() {
   [[ $# -gt 0 ]] || { usage; exit 1; }
-  MODE="$1"; shift
+  MODE="$1"
+  shift
+
   case "$MODE" in
-    unlock-server|singbox-client) ;;
+    singbox-client|parse-ss) ;;
     -h|--help|help) usage; exit 0 ;;
     *) usage; die "Unknown mode: $MODE" ;;
   esac
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --unlock-ip) UNLOCK_IP="${2:-}"; shift 2 ;;
-      --client-ip) CLIENT_IP="${2:-}"; shift 2 ;;
+      --ss-url) SS_URL="${2:-}"; shift 2 ;;
+      --server) SS_SERVER="${2:-}"; shift 2 ;;
+      --port) SS_PORT="${2:-}"; shift 2 ;;
+      --method) SS_METHOD="${2:-}"; shift 2 ;;
+      --password) SS_PASSWORD="${2:-}"; shift 2 ;;
       --config) SINGBOX_CONFIG="${2:-}"; shift 2 ;;
       --relay-config) SINGBOX_RELAY_CONFIG="${2:-}"; shift 2 ;;
-      --dns-transport) DNS_TRANSPORT="${2:-}"; shift 2 ;;
-      --no-firewall) NO_FIREWALL=1; shift ;;
+      --tag) OUTBOUND_TAG="${2:-}"; shift 2 ;;
+      --outbound-detour) OUTBOUND_DETOUR="${2:-}"; shift 2 ;;
       --no-restart) NO_RESTART=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) usage; die "Unknown argument: $1" ;;
@@ -185,119 +200,14 @@ parse_args() {
 
   interactive_fill_missing
 
-  [[ -n "$UNLOCK_IP" ]] || die "--unlock-ip is required in non-interactive mode."
-  valid_ipish "$UNLOCK_IP" || die "--unlock-ip must be an IPv4 address."
-  [[ "$DNS_TRANSPORT" == "tcp" || "$DNS_TRANSPORT" == "udp" ]] || die "--dns-transport must be tcp or udp."
+  [[ -n "$OUTBOUND_TAG" ]] || die "--tag cannot be empty"
 
-  if [[ "$MODE" == "unlock-server" ]]; then
-    [[ -n "$CLIENT_IP" ]] || die "unlock-server mode requires --client-ip in non-interactive mode."
-    valid_ipish "$CLIENT_IP" || die "--client-ip must be an IPv4 address."
-  fi
-}
-
-PKG_MANAGER=""
-INIT_SYSTEM=""
-
-detect_pkg_manager() {
-  if command -v apt-get >/dev/null 2>&1; then
-    PKG_MANAGER="apt"
-  elif command -v apk >/dev/null 2>&1; then
-    PKG_MANAGER="apk"
+  if [[ "$MODE" == "parse-ss" ]]; then
+    [[ -n "$SS_URL" ]] || die "parse-ss mode requires --ss-url"
   else
-    die "Unsupported system: neither apt-get nor apk was found. Currently supports Debian/Ubuntu and Alpine Linux."
+    [[ -n "$SS_URL" || -n "$SS_SERVER" ]] || die "Provide --ss-url or --server/--port/--method/--password"
+    [[ -f "$SINGBOX_CONFIG" ]] || die "sing-box config not found: $SINGBOX_CONFIG"
   fi
-}
-
-detect_init_system() {
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system || -d /etc/systemd/system ]]; then
-    INIT_SYSTEM="systemd"
-  elif command -v rc-service >/dev/null 2>&1; then
-    INIT_SYSTEM="openrc"
-  else
-    INIT_SYSTEM="unknown"
-  fi
-}
-
-pkg_install() {
-  detect_pkg_manager
-  log "Installing packages via $PKG_MANAGER: $*"
-  case "$PKG_MANAGER" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y "$@"
-      ;;
-    apk)
-      apk update
-      apk add --no-cache "$@"
-      ;;
-  esac
-}
-
-install_dns_packages() {
-  detect_pkg_manager
-  case "$PKG_MANAGER" in
-    apt) pkg_install dnsmasq dnsutils curl ;;
-    apk) pkg_install dnsmasq bind-tools curl ;;
-  esac
-}
-
-install_nginx_packages() {
-  detect_pkg_manager
-  case "$PKG_MANAGER" in
-    apt) pkg_install nginx libnginx-mod-stream curl ;;
-    apk) pkg_install nginx nginx-mod-stream curl ;;
-  esac
-}
-
-svc_exists() {
-  local svc="$1"
-  detect_init_system
-  case "$INIT_SYSTEM" in
-    systemd) systemctl list-unit-files "$svc.service" >/dev/null 2>&1 ;;
-    openrc) [[ -x "/etc/init.d/$svc" ]] ;;
-    *) return 1 ;;
-  esac
-}
-
-svc_enable() {
-  local svc="$1"
-  detect_init_system
-  case "$INIT_SYSTEM" in
-    systemd) systemctl enable "$svc" >/dev/null || true ;;
-    openrc) rc-update add "$svc" default >/dev/null 2>&1 || true ;;
-    *) warn "Unknown init system; cannot enable $svc" ;;
-  esac
-}
-
-svc_restart() {
-  local svc="$1"
-  detect_init_system
-  case "$INIT_SYSTEM" in
-    systemd) systemctl restart "$svc" ;;
-    openrc) rc-service "$svc" restart ;;
-    *) warn "Unknown init system; cannot restart $svc"; return 1 ;;
-  esac
-}
-
-svc_stop_disable() {
-  local svc="$1"
-  detect_init_system
-  case "$INIT_SYSTEM" in
-    systemd) systemctl disable --now "$svc" || true ;;
-    openrc) rc-service "$svc" stop || true; rc-update del "$svc" default >/dev/null 2>&1 || true ;;
-    *) warn "Unknown init system; cannot stop/disable $svc" ;;
-  esac
-}
-
-svc_is_active() {
-  local svc="$1"
-  detect_init_system
-  case "$INIT_SYSTEM" in
-    systemd) systemctl is-active "$svc" || true ;;
-    openrc) rc-service "$svc" status || true ;;
-    *) warn "Unknown init system; cannot query $svc" ;;
-  esac
 }
 
 backup_file() {
@@ -309,222 +219,153 @@ backup_file() {
   fi
 }
 
-configure_dnsmasq_ai() {
-  install_dns_packages
-  mkdir -p /etc/dnsmasq.d
-  # Alpine's default dnsmasq.conf may not include /etc/dnsmasq.d; ensure it does.
-  if [[ -f /etc/dnsmasq.conf ]] && ! grep -Eq '^conf-dir=/etc/dnsmasq\.d' /etc/dnsmasq.conf; then
-    backup_file /etc/dnsmasq.conf
-    printf '\n# Managed by %s\nconf-dir=/etc/dnsmasq.d/,*.conf\n' "$SCRIPT_NAME" >> /etc/dnsmasq.conf
-  fi
-  backup_file /etc/dnsmasq.d/custom_ai.conf
+parse_ss_url() {
+  [[ -n "$SS_URL" ]] || return 0
+  local parsed
+  parsed="$(SS_URL="$SS_URL" python3 - <<'PY'
+import os
+import base64
+import urllib.parse
 
-  {
-    echo "# Managed by $SCRIPT_NAME on $(date -u +%FT%TZ)"
-    echo "# AI domains resolve to unlock IP: $UNLOCK_IP"
-    for d in "${AI_DOMAINS[@]}"; do
-      echo "address=/$d/$UNLOCK_IP"
-    done
-  } > /etc/dnsmasq.d/custom_ai.conf
-
-  dnsmasq --test
-  if [[ "$NO_RESTART" -eq 0 ]]; then
-    svc_enable dnsmasq
-    svc_restart dnsmasq
-  fi
-  log "dnsmasq AI rules written to /etc/dnsmasq.d/custom_ai.conf"
-}
-
-configure_nginx_stream() {
-  install_nginx_packages
-
-  if svc_exists sniproxy; then
-    warn "Disabling sniproxy; nginx stream will replace it for SNI forwarding."
-    svc_stop_disable sniproxy
-  fi
-
-  backup_file /etc/nginx/nginx.conf
-  mkdir -p /etc/nginx/stream-conf.d
-
-  python3 - <<'PY'
-from pathlib import Path
-p = Path('/etc/nginx/nginx.conf')
-s = p.read_text()
-# Alpine packages ship stream as a dynamic module and usually load it via
-# /etc/nginx/modules/*.conf. Only add an explicit load_module if no module
-# include is present; otherwise nginx fails with "module is already loaded".
-module_candidates = [
-    '/usr/lib/nginx/modules/ngx_stream_module.so',
-    '/etc/nginx/modules/ngx_stream_module.so',
-    '/usr/share/nginx/modules/ngx_stream_module.so',
-]
-module = next((m for m in module_candidates if Path(m).exists()), None)
-already_loads_modules_dir = 'include /etc/nginx/modules/*.conf;' in s or 'include modules/*.conf;' in s
-if module and 'ngx_stream_module.so' not in s and not already_loads_modules_dir:
-    s = f'load_module {module};\n' + s
-p.write_text(s)
-PY
-
-  python3 - <<'PY'
-from pathlib import Path
-
-# Alpine nginx has /etc/nginx/conf.d/stream.conf with:
-#   stream { include stream.d/*.conf; }
-# Debian/Ubuntu usually does not, so we add a top-level stream block include.
-nginx_conf = Path('/etc/nginx/nginx.conf')
-conf_text = nginx_conf.read_text()
-stream_conf = Path('/etc/nginx/conf.d/stream.conf')
-use_existing_stream_context = False
-if stream_conf.exists():
-    st = stream_conf.read_text()
-    if 'stream {' in st and ('include stream.d/*.conf;' in st or 'include /etc/nginx/stream.d/*.conf;' in st):
-        use_existing_stream_context = True
-
-inner_config = """
-resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
-resolver_timeout 5s;
-
-log_format sni_unlock '$remote_addr [$time_local] $ssl_preread_server_name -> $upstream_addr status=$status sent=$bytes_sent received=$bytes_received time=$session_time';
-access_log /var/log/nginx/sni-unlock-access.log sni_unlock;
-error_log /var/log/nginx/sni-unlock-error.log notice;
-
-server {
-    listen 0.0.0.0:443 reuseport;
-    ssl_preread on;
-    proxy_connect_timeout 10s;
-    proxy_timeout 300s;
-    proxy_pass $ssl_preread_server_name:443;
-}
-""".lstrip()
-
-if use_existing_stream_context:
-    target_dir = Path('/etc/nginx/stream.d')
-    target_dir.mkdir(parents=True, exist_ok=True)
-    Path('/etc/nginx/stream.d/ai-unlock.conf').write_text(inner_config)
-    # Remove old top-level config if a previous run created it.
-    old = Path('/etc/nginx/stream-conf.d/ai-unlock.conf')
-    if old.exists():
-        old.unlink()
-    marker = 'include /etc/nginx/stream-conf.d/*.conf;'
-    if marker in conf_text:
-        lines = [ln for ln in conf_text.splitlines() if marker not in ln and 'SNI unlock stream configs' not in ln]
-        nginx_conf.write_text('\n'.join(lines).rstrip() + '\n')
+url = os.environ['SS_URL'].strip()
+if not url.startswith('ss://'):
+    raise SystemExit('Shadowsocks URL must start with ss://')
+raw = url[5:]
+raw = raw.split('#', 1)[0]
+if '?' in raw:
+    raw, query = raw.split('?', 1)
+    params = urllib.parse.parse_qs(query)
+    plugin = params.get('plugin', [''])[0]
+    if plugin:
+        raise SystemExit('Plugin parameters are not supported by this script')
+if '@' not in raw:
+    decoded = base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)).decode()
+    if '@' not in decoded:
+        raise SystemExit('Unsupported ss:// format')
+    raw = decoded
+userinfo, hostport = raw.rsplit('@', 1)
+if ':' not in userinfo:
+    userinfo = base64.urlsafe_b64decode(userinfo + '=' * (-len(userinfo) % 4)).decode()
+if ':' not in userinfo:
+    raise SystemExit('Invalid method:password segment')
+method, password = userinfo.split(':', 1)
+if hostport.startswith('['):
+    host, rest = hostport[1:].split(']', 1)
+    if not rest.startswith(':'):
+        raise SystemExit('Invalid IPv6 host/port in ss:// URL')
+    port = rest[1:]
 else:
-    target_dir = Path('/etc/nginx/stream-conf.d')
-    target_dir.mkdir(parents=True, exist_ok=True)
-    Path('/etc/nginx/stream-conf.d/ai-unlock.conf').write_text('stream {\n' + ''.join('    '+line if line.strip() else line for line in inner_config.splitlines(True)) + '}\n')
-    marker = 'include /etc/nginx/stream-conf.d/*.conf;'
-    if marker not in conf_text:
-        nginx_conf.write_text(conf_text.rstrip() + '\n\n# SNI unlock stream configs\n' + marker + '\n')
+    if ':' not in hostport:
+        raise SystemExit('Missing port in ss:// URL')
+    host, port = hostport.rsplit(':', 1)
+print(method)
+print(password)
+print(host)
+print(port)
 PY
-
-  nginx -t
-  if [[ "$NO_RESTART" -eq 0 ]]; then
-    svc_enable nginx
-    svc_restart nginx
-  fi
-  log "nginx stream SNI proxy configured on 0.0.0.0:443"
+)"
+  SS_METHOD="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  SS_PASSWORD="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  SS_SERVER="$(printf '%s\n' "$parsed" | sed -n '3p')"
+  SS_PORT="$(printf '%s\n' "$parsed" | sed -n '4p')"
 }
 
-configure_firewall_unlock() {
-  [[ "$NO_FIREWALL" -eq 0 ]] || { warn "Skipping firewall changes due to --no-firewall"; return; }
-  need_cmd iptables
-
-  log "Restricting 53/80/443 to client IP $CLIENT_IP using iptables. SSH is not touched."
-  iptables -C INPUT -p tcp -s "$CLIENT_IP" --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp -s "$CLIENT_IP" --dport 443 -j ACCEPT
-  iptables -C INPUT -p tcp -s "$CLIENT_IP" --dport 80  -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -p tcp -s "$CLIENT_IP" --dport 80  -j ACCEPT
-  iptables -C INPUT -p tcp -s "$CLIENT_IP" --dport 53  -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -p tcp -s "$CLIENT_IP" --dport 53  -j ACCEPT
-  iptables -C INPUT -p udp -s "$CLIENT_IP" --dport 53  -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p udp -s "$CLIENT_IP" --dport 53  -j ACCEPT
-
-  iptables -C INPUT -p tcp --dport 443 -j DROP 2>/dev/null || iptables -I INPUT 5 -p tcp --dport 443 -j DROP
-  iptables -C INPUT -p tcp --dport 80  -j DROP 2>/dev/null || iptables -I INPUT 6 -p tcp --dport 80  -j DROP
-  iptables -C INPUT -p tcp --dport 53  -j DROP 2>/dev/null || iptables -I INPUT 7 -p tcp --dport 53  -j DROP
-  iptables -C INPUT -p udp --dport 53  -j DROP 2>/dev/null || iptables -I INPUT 8 -p udp --dport 53  -j DROP
-
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4
-    log "iptables rules persisted to /etc/iptables/rules.v4"
-  elif [[ -d /etc/iptables ]]; then
-    iptables-save > /etc/iptables/rules.v4
-    log "iptables rules saved to /etc/iptables/rules.v4"
-  else
-    warn "iptables rules applied but not persisted; install iptables-persistent if needed."
-  fi
+validate_ss_fields() {
+  [[ -n "$SS_SERVER" ]] || die "Shadowsocks server is empty"
+  [[ -n "$SS_METHOD" ]] || die "Shadowsocks method is empty"
+  [[ -n "$SS_PASSWORD" ]] || die "Shadowsocks password is empty"
+  valid_port "$SS_PORT" || die "Invalid Shadowsocks port: $SS_PORT"
 }
 
-verify_unlock_server() {
-  log "Listeners:"
-  ss -lntup | grep -E ':(53|80|443)\b' || true
-
-  if command -v dig >/dev/null 2>&1; then
-    log "Local DNS verification:"
-    dig +time=3 +tries=1 chatgpt.com @127.0.0.1 +short || true
-    dig +time=3 +tries=1 claude.ai @127.0.0.1 +short || true
-  fi
-
-  log "Service status summary:"
-  svc_is_active dnsmasq
-  svc_is_active nginx
+show_parsed_ss() {
+  parse_ss_url
+  validate_ss_fields
+  cat <<EOF
+server=$SS_SERVER
+port=$SS_PORT
+method=$SS_METHOD
+password=$SS_PASSWORD
+EOF
 }
 
 patch_singbox_client() {
   need_cmd python3
-  [[ -f "$SINGBOX_CONFIG" ]] || die "sing-box config not found: $SINGBOX_CONFIG"
   backup_file "$SINGBOX_CONFIG"
 
-  local dns_addr
-  if [[ "$DNS_TRANSPORT" == "tcp" ]]; then
-    dns_addr="tcp://$UNLOCK_IP"
-  else
-    dns_addr="udp://$UNLOCK_IP"
-  fi
-
   AI_DOMAINS_STR="$(printf '%s\n' "${AI_DOMAINS[@]}")" \
-  UNLOCK_DNS_ADDR="$dns_addr" \
   SINGBOX_CONFIG="$SINGBOX_CONFIG" \
+  SS_SERVER="$SS_SERVER" \
+  SS_PORT="$SS_PORT" \
+  SS_METHOD="$SS_METHOD" \
+  SS_PASSWORD="$SS_PASSWORD" \
+  OUTBOUND_TAG="$OUTBOUND_TAG" \
+  OUTBOUND_DETOUR="$OUTBOUND_DETOUR" \
   python3 - <<'PY'
-import json, os, pathlib
+import json
+import os
+import pathlib
+
 path = pathlib.Path(os.environ['SINGBOX_CONFIG'])
 conf = json.loads(path.read_text())
 ai_domains = [x.strip() for x in os.environ['AI_DOMAINS_STR'].splitlines() if x.strip()]
-dns_addr = os.environ['UNLOCK_DNS_ADDR']
+outbound_tag = os.environ['OUTBOUND_TAG']
+outbound_detour = os.environ.get('OUTBOUND_DETOUR', '')
 
-# DNS section
+# Clean up the old DNS hijack scheme if present.
 dns = conf.setdefault('dns', {})
 servers = dns.setdefault('servers', [])
-servers = [s for s in servers if s.get('tag') != 'ai-unlock-dns']
-servers.append({'tag': 'ai-unlock-dns', 'address': dns_addr, 'detour': 'direct'})
-dns['servers'] = servers
-
+dns['servers'] = [server for server in servers if server.get('tag') != 'ai-unlock-dns']
 rules = dns.setdefault('rules', [])
-# remove prior generated rule by server tag
-rules = [r for r in rules if r.get('server') != 'ai-unlock-dns']
-rules.insert(0, {'domain_suffix': ai_domains, 'server': 'ai-unlock-dns'})
-dns['rules'] = rules
-dns.setdefault('strategy', 'ipv4_only')
+dns['rules'] = [rule for rule in rules if rule.get('server') != 'ai-unlock-dns']
 
-# Outbounds: direct + block
 outbounds = conf.setdefault('outbounds', [])
-if not any(o.get('tag') == 'direct' for o in outbounds):
+outbounds = [outbound for outbound in outbounds if outbound.get('tag') != outbound_tag]
+ss_outbound = {
+    'type': 'shadowsocks',
+    'tag': outbound_tag,
+    'server': os.environ['SS_SERVER'],
+    'server_port': int(os.environ['SS_PORT']),
+    'method': os.environ['SS_METHOD'],
+    'password': os.environ['SS_PASSWORD'],
+}
+if outbound_detour:
+    ss_outbound['detour'] = outbound_detour
+outbounds.append(ss_outbound)
+if not any(outbound.get('tag') == 'direct' for outbound in outbounds):
     outbounds.insert(0, {'type': 'direct', 'tag': 'direct'})
-if not any(o.get('tag') == 'block' for o in outbounds):
+if not any(outbound.get('tag') == 'block' for outbound in outbounds):
     outbounds.append({'type': 'block', 'tag': 'block'})
+conf['outbounds'] = outbounds
 
-# Route rules: block AI UDP/443, then AI direct
 route = conf.setdefault('route', {})
-rrules = route.setdefault('rules', [])
-# remove old rules with exactly same generated domain list and generated outbounds
-rrules = [r for r in rrules if not (r.get('domain_suffix') == ai_domains and r.get('outbound') in ('direct', 'block'))]
-rrules.insert(0, {'domain_suffix': ai_domains, 'network': 'udp', 'port': 443, 'outbound': 'block'})
-rrules.insert(1, {'domain_suffix': ai_domains, 'outbound': 'direct'})
-route['rules'] = rrules
-route.setdefault('final', 'direct')
+route_rules = route.setdefault('rules', [])
+markers = {'openai.com', 'chatgpt.com', 'claude.ai'}
+def is_old_generated(rule):
+    domain_suffix = rule.get('domain_suffix')
+    if not isinstance(domain_suffix, list):
+        return False
+    if not markers.issubset(set(domain_suffix)):
+        return False
+    return rule.get('outbound') in ('direct', 'block', outbound_tag, 'ai-unlock-ss') or rule.get('server') == 'ai-unlock-dns'
+route_rules = [rule for rule in route_rules if not is_old_generated(rule)]
+route_rules.insert(0, {'domain_suffix': ai_domains, 'network': 'udp', 'port': 443, 'outbound': 'block'})
+route_rules.insert(1, {'domain_suffix': ai_domains, 'outbound': outbound_tag})
+route['rules'] = route_rules
+if route.get('final') is None:
+    route['final'] = 'direct'
 
 path.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + '\n')
 PY
 
   log "Patched sing-box config: $SINGBOX_CONFIG"
+}
+
+svc_exists() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl list-unit-files "$1.service" >/dev/null 2>&1
+  else
+    return 1
+  fi
 }
 
 singbox_check_and_restart() {
@@ -554,9 +395,9 @@ singbox_check_and_restart() {
 
   if [[ "$NO_RESTART" -eq 0 ]]; then
     if svc_exists sing-box; then
-      svc_restart sing-box
+      systemctl restart sing-box
       sleep 1
-      svc_is_active sing-box
+      systemctl is-active sing-box
       log "sing-box restarted."
     else
       warn "sing-box service not found; config checked but service not restarted."
@@ -565,44 +406,29 @@ singbox_check_and_restart() {
 }
 
 verify_singbox_client() {
-  log "Testing unlock DNS from this host."
-  if command -v dig >/dev/null 2>&1; then
-    if [[ "$DNS_TRANSPORT" == "tcp" ]]; then
-      dig +tcp +time=3 +tries=1 chatgpt.com @"$UNLOCK_IP" +short || true
-      dig +tcp +time=3 +tries=1 claude.ai @"$UNLOCK_IP" +short || true
-    else
-      dig +time=3 +tries=1 chatgpt.com @"$UNLOCK_IP" +short || true
-      dig +time=3 +tries=1 claude.ai @"$UNLOCK_IP" +short || true
-    fi
-  else
-    warn "dig not installed; skip DNS verification."
-  fi
+  log "Testing TCP to Shadowsocks server."
+  timeout 6 bash -c "</dev/tcp/$SS_SERVER/$SS_PORT" && log "TCP $SS_PORT open on $SS_SERVER" || warn "Cannot reach $SS_SERVER:$SS_PORT"
 
-  log "Testing TCP/443 to unlock VPS."
-  timeout 5 bash -c "</dev/tcp/$UNLOCK_IP/443" && log "TCP 443 open" || warn "TCP 443 not reachable"
-
-  log "sing-box listeners matching common ports:"
+  log "Current sing-box listeners:"
   ss -lntup | grep -E 'sing-box' || true
+
+  log "AI domains routed to outbound tag: $OUTBOUND_TAG"
 }
 
 main() {
   parse_args "$@"
+
+  if [[ "$MODE" == "parse-ss" ]]; then
+    show_parsed_ss
+    exit 0
+  fi
+
   need_root
-
-  case "$MODE" in
-    unlock-server)
-      configure_dnsmasq_ai
-      configure_nginx_stream
-      configure_firewall_unlock
-      verify_unlock_server
-      ;;
-    singbox-client)
-      patch_singbox_client
-      singbox_check_and_restart
-      verify_singbox_client
-      ;;
-  esac
-
+  parse_ss_url
+  validate_ss_fields
+  patch_singbox_client
+  singbox_check_and_restart
+  verify_singbox_client
   log "Done."
 }
 
