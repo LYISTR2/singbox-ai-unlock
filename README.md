@@ -24,9 +24,24 @@
 - ChatGPT 网页版
 - Claude
 - Gemini
+- Grok
 - 其他对 TLS / 证书 / App 网络环境更敏感的 AI 服务
 
 因为它不再把 AI 域名解析成“解锁端 IP”，而是让连接正常解析真实域名，再通过 sing-box 的 Shadowsocks outbound 出站。
+
+---
+
+## 脚本特性
+
+- 自动检测 sing-box 版本：**1.11+ 生成新版 `action: reject` 规则**，旧版生成 `outbound: block` 规则（可用 `--compat` 强制指定）；
+- 路由规则自动插入到 `sniff` / `hijack-dns` 等 action 规则**之后**，不破坏已有的嗅探与 DNS 劫持；
+- `sing-box check` 失败时**自动恢复备份**，不会留下坏配置；
+- 支持 `--dry-run`：先看配置 diff，确认无误再实际写入；
+- 内置 `rollback` 子命令：一条命令恢复最近备份并重启；
+- 支持 `--add-domain` / `--domains-file` 追加自定义域名，不用改脚本源码；
+- 密码可通过环境变量 `SS_PASSWORD` / `SS_URL` 传入，避免留在 shell 历史里；
+- 配置文件和备份自动 `chmod 600`，备份只保留最近 5 份；
+- 重复运行幂等：旧规则（包括换过 `--tag` 之后的残留）会被自动清理后重建。
 
 ---
 
@@ -61,25 +76,29 @@
 同时脚本会：
 
 - 为 AI 域名添加路由规则；
-- 阻断 AI 域名的 `UDP 443`；
+- 阻断 AI 域名的 `UDP 443`（新版 sing-box 用 `action: reject`，旧版用 `outbound: block`）；
 - 强制这些域名回落到 TCP 443，避免 QUIC / HTTP3 绕过代理分流。
 
 ---
 
-## 支持系统
+## 支持系统与版本
 
 当前脚本运行在 **sing-box 节点 VPS** 上，已按常见 Linux 环境设计：
 
 - Debian / Ubuntu
 - 其他能运行 `bash + python3 + sing-box` 的 Linux 系统
 
-脚本本身不依赖包管理器安装组件，因为它不再负责搭解锁端服务。
-
 要求环境里已有：
 
 - `bash`
 - `python3`
 - `sing-box`
+
+sing-box 版本兼容：
+
+- **1.11 及以上**：自动使用新版规则语法（`action: reject`），不再生成已废弃的 `block` outbound；
+- **1.10 及以下**：自动使用旧版语法；
+- 检测不到版本时（比如 `--no-restart` 且没装 sing-box），默认按新版处理，可用 `--compat legacy` 强制旧版。
 
 ---
 
@@ -169,15 +188,18 @@ Shadowsocks method (example: 2022-blake3-aes-256-gcm):
 Shadowsocks password:
 ```
 
+（密码是隐藏输入，不会回显。）
+
 输入完成后，脚本会自动：
 
-- 备份你的 sing-box 主配置；
-- 删除旧的 `ai-unlock-dns` DNS 劫持规则；
+- 备份你的 sing-box 主配置（并收紧为 `600` 权限，只保留最近 5 份备份）；
+- 删除旧的 `ai-unlock-dns` DNS 劫持规则和旧版分流规则；
+- 检测 sing-box 版本，选择新旧规则语法；
 - 新增一个 Shadowsocks outbound；
-- 把 AI 域名改成走这个 outbound；
-- 保留 AI 域名 `UDP 443 -> block` 规则；
-- 执行 `sing-box check`；
-- 重启 sing-box 服务。
+- 把 AI 域名规则插入到 `sniff` / `hijack-dns` 之后；
+- 阻断 AI 域名 `UDP 443`；
+- 执行 `sing-box check`，**失败时自动恢复备份**；
+- 重启 sing-box 服务，失败时提示查看日志和回滚命令。
 
 ---
 
@@ -190,6 +212,19 @@ bash ai_singbox_unlock_setup.sh singbox-client \
   --ss-url 'ss://BASE64@1.2.3.4:443#JP'
 ```
 
+### 通过环境变量传节点（不留 shell 历史，推荐）
+
+```bash
+SS_URL='ss://BASE64@1.2.3.4:443#JP' bash ai_singbox_unlock_setup.sh singbox-client
+```
+
+或者：
+
+```bash
+SS_PASSWORD='YOUR_PASSWORD' bash ai_singbox_unlock_setup.sh singbox-client \
+  --server 1.2.3.4 --port 20021 --method 2022-blake3-aes-256-gcm
+```
+
 ### 手动指定 Shadowsocks 参数
 
 ```bash
@@ -198,6 +233,34 @@ bash ai_singbox_unlock_setup.sh singbox-client \
   --port 20021 \
   --method 2022-blake3-aes-256-gcm \
   --password 'YOUR_PASSWORD'
+```
+
+注意：`--password` 走命令行会留在 shell 历史和 `ps` 输出里，脚本会给出提醒。更推荐用环境变量或交互式输入。
+
+### 先看 diff 再落盘（dry run）
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://BASE64@1.2.3.4:443#JP' \
+  --dry-run
+```
+
+只显示将要发生的配置改动（`diff` 格式）并对结果跑 `sing-box check`，不写入任何文件、不重启服务。
+
+### 追加自定义域名
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://...' \
+  --add-domain mistral.ai,meta.ai
+```
+
+或者用文件（每行一个域名，支持 `#` 注释）：
+
+```bash
+bash ai_singbox_unlock_setup.sh singbox-client \
+  --ss-url 'ss://...' \
+  --domains-file my_domains.txt
 ```
 
 ### 指定 sing-box 配置文件路径
@@ -217,6 +280,8 @@ bash ai_singbox_unlock_setup.sh singbox-client \
   --tag ai-jp-ss
 ```
 
+换 tag 重跑时，旧 tag 生成的规则和默认 tag 的旧 outbound 会被自动清理。
+
 ### 指定 detour
 
 如果你希望这个 SS outbound 自己再挂到某个已有出口 tag 上，可以加：
@@ -228,6 +293,18 @@ bash ai_singbox_unlock_setup.sh singbox-client \
 ```
 
 大多数场景留空即可。
+
+### 强制规则语法版本
+
+```bash
+# 强制旧版语法（outbound: block）
+bash ai_singbox_unlock_setup.sh singbox-client --ss-url 'ss://...' --compat legacy
+
+# 强制新版语法（action: reject）
+bash ai_singbox_unlock_setup.sh singbox-client --ss-url 'ss://...' --compat modern
+```
+
+默认 `--compat auto`，自动检测 sing-box 版本。
 
 ### 只改配置，不重启 sing-box
 
@@ -258,7 +335,36 @@ method=...
 password=...
 ```
 
-这个模式只做解析，不改任何配置。
+这个模式只做解析，不改任何配置。支持 SIP002 明文格式、base64 userinfo、整段 base64 和 IPv6 地址。
+
+---
+
+## `rollback` 模式（一键回滚）
+
+如果你想回滚到脚本执行前的状态，直接执行：
+
+```bash
+bash ai_singbox_unlock_setup.sh rollback
+```
+
+脚本会自动：
+
+1. 找到最近一份备份（`config.json.bak.时间戳`）；
+2. 恢复覆盖回主配置；
+3. 执行 `sing-box check` 并重启服务（加 `--no-restart` 可以不重启）。
+
+如果配置路径不是默认的，加上 `--config`：
+
+```bash
+bash ai_singbox_unlock_setup.sh rollback --config /path/to/config.json
+```
+
+也可以手动回滚：
+
+```bash
+cp /usr/local/etc/sing-box/config.json.bak.20260726-xxxxxx /usr/local/etc/sing-box/config.json
+systemctl restart sing-box
+```
 
 ---
 
@@ -279,8 +385,10 @@ password=...
 修改前会自动备份，例如：
 
 ```text
-/usr/local/etc/sing-box/config.json.bak.20260614-xxxxxx
+/usr/local/etc/sing-box/config.json.bak.20260726-xxxxxx
 ```
+
+备份和配置文件都会被设置成 `600` 权限（里面含有 SS 密码），备份只保留最近 5 份。
 
 ---
 
@@ -290,52 +398,58 @@ password=...
 
 - `ai-unlock-dns` 这个 DNS server；
 - AI 域名走 `ai-unlock-dns` 的 DNS 规则；
-- 旧的 AI 分流生成规则（`direct` / `block` / `ai-unlock-ss` 旧版本）。
+- 旧的 AI 分流生成规则（包括 `direct` / `block` / 自定义 tag / `action: reject` 各种历史版本）。
 
-也就是说，它会把仓库旧方案迁移成现在的新方案。
+也就是说，它会把仓库旧方案迁移成现在的新方案，重复运行也不会堆积重复规则。
 
 ---
 
 ## 内置 AI 域名列表
 
-当前脚本内置以下域名：
+`domain_suffix` 是后缀匹配，父域名自动覆盖全部子域名（例如 `openai.com` 已覆盖 `api.openai.com`、`auth.openai.com` 等），所以列表只保留必要条目：
 
 ```text
+# OpenAI / ChatGPT
 openai.com
 chatgpt.com
-chat.openai.com
-auth.openai.com
-auth0.openai.com
-api.openai.com
+sora.com
 oaistatic.com
-cdn.oaistatic.com
-persistent.oaistatic.com
 oaiusercontent.com
-files.oaiusercontent.com
+
+# ChatGPT 依赖的第三方服务
 featuregates.org
 statsig.com
 statsigapi.net
 intercom.io
 intercomcdn.com
+challenges.cloudflare.com
 
+# Anthropic / Claude
 anthropic.com
-api.anthropic.com
 claude.ai
-console.anthropic.com
+claude.com
 
+# Google Gemini / AI Studio
 gemini.google.com
 generativelanguage.googleapis.com
 ai.google.dev
 aistudio.google.com
+notebooklm.google.com
 
+# xAI / Grok
+grok.com
+x.ai
+
+# 其他
 perplexity.ai
 poe.com
 copilot.microsoft.com
 bing.com
-edgeservices.bing.com
 ```
 
-如果以后你发现某个服务资源没走代理，可以编辑脚本里的数组后重新运行。
+其中 `challenges.cloudflare.com` 用于让 ChatGPT 的 Cloudflare 人机验证与站点本身走同一个出口 IP，减少风控。
+
+如果以后你发现某个服务资源没走代理，用 `--add-domain` 或 `--domains-file` 追加即可，不需要改脚本源码。
 
 ---
 
@@ -349,7 +463,7 @@ edgeservices.bing.com
 sing-box check -c <config> [-c <relay-config>]
 ```
 
-如果这里报错，说明配置没通过，脚本会直接停止。
+如果这里报错，脚本会**自动恢复备份**并停止，不会留下坏配置。
 
 ---
 
@@ -414,23 +528,6 @@ cf-mitigated: challenge
 
 ---
 
-## 回滚方法
-
-如果你想回滚到脚本执行前状态：
-
-1. 找到脚本生成的备份文件；
-2. 覆盖回原配置；
-3. 重启 sing-box。
-
-例如：
-
-```bash
-cp /usr/local/etc/sing-box/config.json.bak.20260614-xxxxxx /usr/local/etc/sing-box/config.json
-systemctl restart sing-box
-```
-
----
-
 ## 常见问题
 
 ### 1. 为什么现在不再做 DNS 劫持 + nginx SNI？
@@ -454,14 +551,27 @@ Shadowsocks 出口分流更直接，也更稳定。
 如果 AI 域名走了 UDP 443，可能绕开你配置的 TCP 代理分流逻辑。所以脚本保留：
 
 ```text
-AI 域名 + UDP 443 -> block
+AI 域名 + UDP 443 -> 拒绝（新版 action: reject，旧版 outbound: block）
 ```
 
 让它回落到 TCP 443。
 
 ---
 
-### 3. 如果我的 SS 节点不是直接公网出口，而是另一个链式出口怎么办？
+### 3. 规则插入位置为什么重要？
+
+sing-box 1.11+ 的配置里通常有这样的前置规则：
+
+```json
+{ "action": "sniff" },
+{ "protocol": "dns", "action": "hijack-dns" }
+```
+
+域名分流本身依赖 `sniff` 先嗅探出域名。脚本会把 AI 规则插到这些 action 规则**之后**、其余路由规则之前，既保证优先级，又不破坏嗅探和 DNS 劫持。
+
+---
+
+### 4. 如果我的 SS 节点不是直接公网出口，而是另一个链式出口怎么办？
 
 可以尝试给 outbound 加上：
 
@@ -473,7 +583,7 @@ AI 域名 + UDP 443 -> block
 
 ---
 
-### 4. 脚本支持 VLESS / Trojan / Hysteria 吗？
+### 5. 脚本支持 VLESS / Trojan / Hysteria 吗？
 
 当前版本只支持：
 
@@ -487,7 +597,7 @@ Shadowsocks
 
 ---
 
-### 5. `parse-ss` 输出了密码，这安全吗？
+### 6. `parse-ss` 输出了密码，这安全吗？
 
 `parse-ss` 本来就是调试模式，会把节点内容直接解析显示出来。所以：
 
@@ -499,10 +609,12 @@ Shadowsocks
 
 ## 安全建议
 
+- 优先用环境变量 `SS_URL` / `SS_PASSWORD` 或交互式输入传密码，少用 `--password` 命令行参数；
 - 不要把真实 `ss://` 节点直接写进公开仓库；
 - 不要把真实 IP、密码、token、私钥写进 README；
-- 调试完记得检查 shell 历史记录里有没有敏感命令；
-- 如果某个节点已经在聊天中泄露，建议后续更换密码或整条节点。
+- 调试完记得检查 shell 历史记录里有没有敏感命令（`history -d` 或 `HISTCONTROL=ignorespace`）；
+- 如果某个节点已经在聊天中泄露，建议后续更换密码或整条节点；
+- 脚本会自动把配置和备份权限收紧到 `600`。
 
 ---
 
